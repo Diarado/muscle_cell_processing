@@ -22,10 +22,24 @@ def masks_to_outlines(masks):
 
 
 def process_with_cellpose_gpu(image_path, output_dir, use_gpu=True, 
-                               diameter=None, flow_threshold=0.4, cellprob_threshold=0.0):
+                               diameter=None, flow_threshold=0.4, cellprob_threshold=0.0,
+                               skip_existing=True):
     """
     Use Cellpose v4 with GPU acceleration for nuclei segmentation.
     """
+    
+    # Check if results already exist
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    base_name = Path(image_path).stem
+    masks_file = output_dir / f'{base_name}_masks.npy'
+    
+    if skip_existing and masks_file.exists():
+        print(f"  ✓ Skipping {Path(image_path).name} (already processed)", flush=True)
+        # Load existing results
+        masks = np.load(masks_file)
+        nuclei_count = int(masks.max())
+        return nuclei_count, masks, None, 0.0  # Return None for stats, 0 for time
     
     # Initialize model with GPU
     use_gpu = use_gpu and core.use_gpu()
@@ -109,10 +123,6 @@ def process_with_cellpose_gpu(image_path, output_dir, use_gpu=True,
     plt.tight_layout()
     
     # Save results
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    base_name = Path(image_path).stem
-    
     print(f"  Saving results...", flush=True)
     plt.savefig(output_dir / f'{base_name}_cellpose_gpu.png', dpi=300, bbox_inches='tight')
     
@@ -176,7 +186,7 @@ def calculate_nuclei_stats(masks, img):
     return pd.DataFrame(stats)
 
 
-def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=None):
+def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=None, skip_existing=True):
     """Batch process all images with GPU acceleration."""
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -190,6 +200,7 @@ def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=Non
     
     print(f"\nFound {len(image_files)} images to process")
     print(f"Using GPU: {use_gpu and core.use_gpu()}")
+    print(f"Skip existing: {skip_existing}")
     print(f"Output directory: {output_path}\n")
     print("="*60)
     
@@ -197,6 +208,7 @@ def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=Non
     total_nuclei = 0
     total_time = 0
     successful_images = 0
+    skipped_images = 0
     
     # Process each image
     for i, img_file in enumerate(image_files, 1):
@@ -205,16 +217,20 @@ def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=Non
         
         try:
             count, masks, stats, proc_time = process_with_cellpose_gpu(
-                img_file, output_path, use_gpu, diameter
+                img_file, output_path, use_gpu, diameter, skip_existing=skip_existing
             )
             
-            stats['image'] = img_file.name
-            all_results.append(stats)
-            total_nuclei += count
-            total_time += proc_time
-            successful_images += 1
+            # Only append stats if we actually processed (stats is not None)
+            if stats is not None:
+                stats['image'] = img_file.name
+                all_results.append(stats)
+                total_time += proc_time
+                successful_images += 1
+                print(f"✓ Success: {count} nuclei, {proc_time:.2f}s")
+            else:
+                skipped_images += 1
             
-            print(f"✓ Success: {count} nuclei, {proc_time:.2f}s")
+            total_nuclei += count
             
         except Exception as e:
             print(f"✗ Error processing {img_file.name}: {e}")
@@ -242,29 +258,32 @@ def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=Non
         summary.columns = ['_'.join(col).strip('_') for col in summary.columns]
         summary.to_csv(output_path / 'summary_statistics.csv')
         print(f"✓ Saved: summary_statistics.csv")
-        
-        # Overall summary
-        print(f"\n{'='*60}")
-        print(f"PROCESSING COMPLETE")
-        print(f"{'='*60}")
-        print(f"Total images processed: {successful_images}/{len(image_files)}")
-        print(f"Total nuclei detected: {total_nuclei:,}")
+    
+    # Overall summary
+    print(f"\n{'='*60}")
+    print(f"PROCESSING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Total images found: {len(image_files)}")
+    print(f"Images processed: {successful_images}")
+    print(f"Images skipped: {skipped_images}")
+    print(f"Total nuclei detected: {total_nuclei:,}")
+    if successful_images > 0:
         print(f"Total processing time: {total_time:.2f}s ({total_time/60:.2f} min)")
         print(f"Average time per image: {total_time/successful_images:.2f}s")
-        print(f"GPU used: {use_gpu and core.use_gpu()}")
-        print(f"Results saved to: {output_path}")
-        print(f"{'='*60}\n")
-        
-        return combined_stats
+    print(f"GPU used: {use_gpu and core.use_gpu()}")
+    print(f"Results saved to: {output_path}")
+    print(f"{'='*60}\n")
+    
+    if all_results:
+        return pd.concat(all_results, ignore_index=True)
     else:
-        print("\n✗ No results to save!")
         return None
 
 
 # Run the batch processing
 if __name__ == "__main__":
-    input_directory = "/mnt/d/Jiahe/IU/Cell/crop_1/crop"
-    output_directory = "/mnt/d/Jiahe/IU/Cell/crop_1/cellpose_gpu_results"
+    input_directory = "crop_1/crop"
+    output_directory = "crop_1/cellpose_gpu_results"
     
     # Check GPU
     if core.use_gpu():
@@ -279,5 +298,6 @@ if __name__ == "__main__":
         input_directory, 
         output_directory, 
         use_gpu=use_gpu,
-        diameter=None  # Auto-detect, or specify like 30 for ~30 pixel diameter
+        diameter=None,  # Auto-detect, or specify like 30 for ~30 pixel diameter
+        skip_existing=True  # Set to False to reprocess all images
     )
