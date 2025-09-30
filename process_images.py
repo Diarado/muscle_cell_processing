@@ -1,4 +1,4 @@
-from cellpose import models, io, plot
+from cellpose import models, io, core
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 import time
+from skimage import segmentation
 
 # Check GPU availability
 print(f"CUDA available: {torch.cuda.is_available()}")
@@ -14,61 +15,57 @@ if torch.cuda.is_available():
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
 
-def process_with_cellpose_gpu(image_path, output_dir, model_type='nuclei', use_gpu=True, 
+def masks_to_outlines(masks):
+    """Convert masks to outlines (replacement for plot.masks_to_outlines)."""
+    outlines = segmentation.find_boundaries(masks, mode='inner')
+    return outlines
+
+
+def process_with_cellpose_gpu(image_path, output_dir, use_gpu=True, 
                                diameter=None, flow_threshold=0.4, cellprob_threshold=0.0):
     """
-    Use Cellpose with GPU acceleration for nuclei segmentation.
-    
-    Parameters:
-    - image_path: path to input image
-    - output_dir: directory to save results
-    - model_type: 'nuclei', 'cyto', 'cyto2', 'cyto3'
-    - use_gpu: whether to use GPU (automatically detected if True)
-    - diameter: expected nucleus diameter in pixels (None = auto-detect)
-    - flow_threshold: threshold for flow error (default 0.4)
-    - cellprob_threshold: threshold for cell probability (default 0.0)
+    Use Cellpose v4 with GPU acceleration for nuclei segmentation.
     """
     
     # Initialize model with GPU
-    # gpu=True will automatically use GPU if available, fallback to CPU if not
-    model = models.Cellpose(gpu=use_gpu, model_type=model_type)
+    use_gpu = use_gpu and core.use_gpu()
     
-    # Check if GPU is actually being used
-    if use_gpu and torch.cuda.is_available():
-        print(f"✓ Using GPU for {Path(image_path).name}")
-    else:
-        print(f"✗ Using CPU for {Path(image_path).name}")
+    # For Cellpose v4
+    model = models.CellposeModel(gpu=use_gpu)
     
     # Read image
     img = io.imread(str(image_path))
     
+    # Extract blue channel for nuclei
+    if img.ndim == 3 and img.shape[2] >= 3:
+        img_blue = img[:, :, 2]  # Blue channel only
+    else:
+        img_blue = img
+    
+    print(f"  Processing {Path(image_path).name} (shape: {img_blue.shape})...", flush=True)
+    
     # Start timing
     start_time = time.time()
     
-    # Define channels
-    # channels = [cytoplasm, nucleus]
-    # For nuclei in blue channel: [0, 2] means no cytoplasm, nucleus in channel 2
-    # For nuclei detection only: [0, 0] uses grayscale
-    channels = [0, 2]  # Use blue channel (index 2) for nuclei
-    
     # Run segmentation with GPU
-    masks, flows, styles, diams = model.eval(
-        img, 
+    print(f"  Running segmentation...", flush=True)
+    masks, flows, styles = model.eval(
+        img_blue,
         diameter=diameter,
-        channels=channels,
         flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold,
-        normalize=True,  # Normalize images
-        batch_size=8  # Process multiple images at once if doing batch
+        normalize=True
     )
     
     # End timing
     elapsed_time = time.time() - start_time
     
     # Count nuclei
-    nuclei_count = masks.max()
+    nuclei_count = int(masks.max())
+    print(f"  Found {nuclei_count} nuclei in {elapsed_time:.2f}s", flush=True)
     
     # Create visualization
+    print(f"  Creating visualization...", flush=True)
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # Original
@@ -77,29 +74,34 @@ def process_with_cellpose_gpu(image_path, output_dir, model_type='nuclei', use_g
     axes[0, 0].axis('off')
     
     # Blue channel
-    axes[0, 1].imshow(img[:, :, 2], cmap='Blues')
+    axes[0, 1].imshow(img_blue, cmap='Blues')
     axes[0, 1].set_title('Blue Channel (Nuclei)', fontsize=12)
     axes[0, 1].axis('off')
     
     # Red channel
-    axes[0, 2].imshow(img[:, :, 0], cmap='Reds')
-    axes[0, 2].set_title('Red Channel (Membrane)', fontsize=12)
+    if img.ndim == 3:
+        axes[0, 2].imshow(img[:, :, 0], cmap='Reds')
+        axes[0, 2].set_title('Red Channel (Membrane)', fontsize=12)
     axes[0, 2].axis('off')
     
     # Segmentation masks (colored by nucleus)
-    axes[1, 0].imshow(masks, cmap='nipy_spectral')
+    axes[1, 0].imshow(masks, cmap='nipy_spectral', vmax=min(masks.max(), 1000))
     axes[1, 0].set_title(f'Segmented Nuclei (n={nuclei_count})', fontsize=12)
     axes[1, 0].axis('off')
     
     # Flow field visualization
-    axes[1, 1].imshow(flows[0][0], cmap='RdBu_r')
-    axes[1, 1].set_title('Flow Field (X)', fontsize=12)
-    axes[1, 1].axis('off')
+    if len(flows) > 0 and flows[0] is not None:
+        axes[1, 1].imshow(flows[0], cmap='RdBu_r')
+        axes[1, 1].set_title('Flow Field', fontsize=12)
+        axes[1, 1].axis('off')
+    else:
+        axes[1, 1].axis('off')
     
     # Overlay with outlines
-    outlines = plot.masks_to_outlines(masks)
-    overlay = img.copy()
-    overlay[outlines > 0] = [0, 255, 255]  # Cyan outlines
+    print(f"  Computing outlines...", flush=True)
+    outlines = masks_to_outlines(masks)
+    overlay = img.copy() if img.ndim == 3 else np.stack([img_blue]*3, axis=-1)
+    overlay[outlines] = [0, 255, 255]  # Cyan outlines
     axes[1, 2].imshow(overlay)
     axes[1, 2].set_title(f'Overlay (Time: {elapsed_time:.2f}s)', fontsize=12)
     axes[1, 2].axis('off')
@@ -111,16 +113,27 @@ def process_with_cellpose_gpu(image_path, output_dir, model_type='nuclei', use_g
     output_dir.mkdir(exist_ok=True, parents=True)
     base_name = Path(image_path).stem
     
+    print(f"  Saving results...", flush=True)
     plt.savefig(output_dir / f'{base_name}_cellpose_gpu.png', dpi=300, bbox_inches='tight')
-    np.save(output_dir / f'{base_name}_masks.npy', masks)
-    np.save(output_dir / f'{base_name}_flows.npy', flows[0])
+    
+    # Save masks
+    if masks.max() > 65535:
+        np.save(output_dir / f'{base_name}_masks.npy', masks.astype(np.uint32))
+    else:
+        np.save(output_dir / f'{base_name}_masks.npy', masks.astype(np.uint16))
+    
+    if len(flows) > 0 and flows[0] is not None:
+        np.save(output_dir / f'{base_name}_flows.npy', flows[0])
     
     plt.close()
     
     # Calculate statistics
-    stats = calculate_nuclei_stats(masks, img)
+    print(f"  Calculating statistics...", flush=True)
+    stats = calculate_nuclei_stats(masks, img_blue)
     stats['processing_time_sec'] = elapsed_time
-    stats['gpu_used'] = use_gpu and torch.cuda.is_available()
+    stats['gpu_used'] = use_gpu
+    
+    print(f"  ✓ Completed {Path(image_path).name}\n", flush=True)
     
     return nuclei_count, masks, stats, elapsed_time
 
@@ -129,10 +142,22 @@ def calculate_nuclei_stats(masks, img):
     """Calculate properties of each nucleus."""
     from skimage.measure import regionprops
     
-    props = regionprops(masks, intensity_image=img[:, :, 2])  # Blue channel
+    # For very large number of masks, sample
+    max_labels = 5000  # Process at most 5000 nuclei for stats
+    
+    if masks.max() > max_labels:
+        print(f"    {masks.max()} nuclei detected. Computing stats for first {max_labels}...", flush=True)
+        masks_sample = masks.copy()
+        masks_sample[masks_sample > max_labels] = 0
+        props = regionprops(masks_sample, intensity_image=img)
+    else:
+        props = regionprops(masks, intensity_image=img)
     
     stats = []
-    for prop in props:
+    for i, prop in enumerate(props):
+        if i % 1000 == 0 and i > 0:
+            print(f"    Processing nucleus {i}/{len(props)}...", flush=True)
+        
         stats.append({
             'label': prop.label,
             'area': prop.area,
@@ -151,8 +176,7 @@ def calculate_nuclei_stats(masks, img):
     return pd.DataFrame(stats)
 
 
-def batch_process_cellpose_gpu(input_dir, output_dir, model_type='nuclei', 
-                                use_gpu=True, diameter=None):
+def batch_process_cellpose_gpu(input_dir, output_dir, use_gpu=True, diameter=None):
     """Batch process all images with GPU acceleration."""
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -164,34 +188,47 @@ def batch_process_cellpose_gpu(input_dir, output_dir, model_type='nuclei',
                   list(input_path.glob('*.png')) + \
                   list(input_path.glob('*.tif'))
     
-    print(f"Found {len(image_files)} images to process")
-    print(f"Using GPU: {use_gpu and torch.cuda.is_available()}\n")
+    print(f"\nFound {len(image_files)} images to process")
+    print(f"Using GPU: {use_gpu and core.use_gpu()}")
+    print(f"Output directory: {output_path}\n")
+    print("="*60)
     
     all_results = []
     total_nuclei = 0
     total_time = 0
+    successful_images = 0
     
-    # Process with progress bar
-    for img_file in tqdm(image_files, desc="Processing images"):
+    # Process each image
+    for i, img_file in enumerate(image_files, 1):
+        print(f"\n[{i}/{len(image_files)}] Processing: {img_file.name}")
+        print("-"*60)
+        
         try:
             count, masks, stats, proc_time = process_with_cellpose_gpu(
-                img_file, output_path, model_type, use_gpu, diameter
+                img_file, output_path, use_gpu, diameter
             )
             
             stats['image'] = img_file.name
             all_results.append(stats)
             total_nuclei += count
             total_time += proc_time
+            successful_images += 1
             
-            print(f"  {img_file.name}: {count} nuclei in {proc_time:.2f}s")
+            print(f"✓ Success: {count} nuclei, {proc_time:.2f}s")
             
         except Exception as e:
-            print(f"  Error processing {img_file.name}: {e}")
+            print(f"✗ Error processing {img_file.name}: {e}")
+            import traceback
+            traceback.print_exc()
     
     # Combine all statistics
     if all_results:
+        print("\n" + "="*60)
+        print("Saving combined results...")
+        
         combined_stats = pd.concat(all_results, ignore_index=True)
         combined_stats.to_csv(output_path / 'all_nuclei_statistics.csv', index=False)
+        print(f"✓ Saved: all_nuclei_statistics.csv")
         
         # Summary statistics per image
         summary = combined_stats.groupby('image').agg({
@@ -204,31 +241,33 @@ def batch_process_cellpose_gpu(input_dir, output_dir, model_type='nuclei',
         }).round(2)
         summary.columns = ['_'.join(col).strip('_') for col in summary.columns]
         summary.to_csv(output_path / 'summary_statistics.csv')
+        print(f"✓ Saved: summary_statistics.csv")
         
         # Overall summary
         print(f"\n{'='*60}")
         print(f"PROCESSING COMPLETE")
         print(f"{'='*60}")
-        print(f"Total images processed: {len(image_files)}")
-        print(f"Total nuclei detected: {total_nuclei}")
-        print(f"Total processing time: {total_time:.2f}s")
-        print(f"Average time per image: {total_time/len(image_files):.2f}s")
-        print(f"GPU used: {use_gpu and torch.cuda.is_available()}")
+        print(f"Total images processed: {successful_images}/{len(image_files)}")
+        print(f"Total nuclei detected: {total_nuclei:,}")
+        print(f"Total processing time: {total_time:.2f}s ({total_time/60:.2f} min)")
+        print(f"Average time per image: {total_time/successful_images:.2f}s")
+        print(f"GPU used: {use_gpu and core.use_gpu()}")
         print(f"Results saved to: {output_path}")
         print(f"{'='*60}\n")
         
         return combined_stats
     else:
-        print("No results to save!")
+        print("\n✗ No results to save!")
         return None
+
 
 # Run the batch processing
 if __name__ == "__main__":
-    input_directory = "crop_1/crop"
-    output_directory = "crop_1/cellpose_gpu_results"
+    input_directory = "/mnt/d/Jiahe/IU/Cell/crop_1/crop"
+    output_directory = "/mnt/d/Jiahe/IU/Cell/crop_1/cellpose_gpu_results"
     
     # Check GPU
-    if torch.cuda.is_available():
+    if core.use_gpu():
         print(f"✓ GPU detected: {torch.cuda.get_device_name(0)}")
         use_gpu = True
     else:
@@ -239,7 +278,6 @@ if __name__ == "__main__":
     results = batch_process_cellpose_gpu(
         input_directory, 
         output_directory, 
-        model_type='nuclei',  # or 'cyto', 'cyto2' for cell segmentation
         use_gpu=use_gpu,
         diameter=None  # Auto-detect, or specify like 30 for ~30 pixel diameter
     )
